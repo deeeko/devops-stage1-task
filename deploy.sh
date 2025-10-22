@@ -49,3 +49,4 @@ else
   git clone -b "$BRANCH" "$GIT_CLONE_URL"
   log "Stage 3 complete: Repository cloned successfully."
 fi
+git push -u origin main
