@@ -1,52 +1,145 @@
 #!/bin/bash
-# deploy.sh - Automated deployment of a Dockerized app to a remote server
+# DevOps Stage 1 Task – Automated Deployment Script
+# Author: deeexo
+# Description: Clones a repo, connects to a remote server via SSH,
+# installs Docker + Nginx, deploys app container, and configures proxy.
 
-# Exit immediately if a command fails, treat unset variables as errors, fail on pipe errors
 set -euo pipefail
 
-# Define a timestamped log file
-LOG_FILE="deploy_$(date +%Y%m%d).log"
+#==============================#
+#          LOGGING             #
+#==============================#
+LOG_FILE="deploy_$(date +%Y%m%d_%H%M%S).log"
 
-# Function to log messages
 log() {
-  # Prints timestamped message to terminal and appends to log file
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Step 1 complete: Logging is set up"
-# Stage 2: Collect user input
+trap 'log "❌ ERROR: Deployment failed at line $LINENO."' ERR
+
+log "🚀 Starting DevOps Stage 1 Deployment Script"
+
+#==============================#
+#      USER INPUT SECTION      #
+#==============================#
 read -p "Enter Git repository URL: " GIT_REPO
-read -sp "Enter Personal Access Token (PAT): " PAT
-echo
+read -p "Enter Personal Access Token (PAT): " PAT
 read -p "Enter branch name (default: main): " BRANCH
-BRANCH=${BRANCH:-main}  # default to main if empty
+BRANCH=${BRANCH:-main}
 read -p "Enter SSH username: " SSH_USER
-read -p "Enter remote server IP: " SERVER_IP
+read -p "Enter remote server IP: " REMOTE_IP
 read -p "Enter SSH key path (default: ~/.ssh/id_rsa): " SSH_KEY
 SSH_KEY=${SSH_KEY:-~/.ssh/id_rsa}
-read -p "Enter application port (internal container port): " APP_PORT
+read -p "Enter internal app port (e.g., 8080): " APP_PORT
 
-log "Stage 2 complete: User input collected"
-# -----------------------------
-# Stage 3: Clone or update repo
-# -----------------------------
+log "✅ Input collection complete"
 
-# Extract repo name from URL (e.g., getting-started)
-REPO_NAME=$(basename -s .git "$GIT_REPO")
-
-# If folder already exists, update it; otherwise, clone it
-if [ -d "$REPO_NAME" ]; then
-  log "Repository already exists. Pulling latest changes..."
-  cd "$REPO_NAME"
-  git fetch origin "$BRANCH"
-  git checkout "$BRANCH"
-  git pull origin "$BRANCH"
-  cd ..
-  log "Stage 3 complete: Repository updated successfully."
-else
-  log "Cloning repository..."
-  GIT_CLONE_URL="${GIT_REPO/https:\/\//https://$PAT@}"
-  git clone -b "$BRANCH" "$GIT_CLONE_URL"
-  log "Stage 3 complete: Repository cloned successfully."
+#==============================#
+#       GIT CLONE STAGE        #
+#==============================#
+if [ -d "app" ]; then
+  log "📁 Existing app directory found. Removing..."
+  rm -rf app
 fi
-git push -u origin main
+
+log "📦 Cloning repository..."
+git clone -b "$BRANCH" "https://${PAT}@${GIT_REPO#https://}" app >>"$LOG_FILE" 2>&1
+log "✅ Repository cloned successfully"
+
+#==============================#
+#       SSH CONNECTION         #
+#==============================#
+log "🔐 Checking SSH connection..."
+if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$REMOTE_IP" "echo connected" >/dev/null 2>&1; then
+  log "✅ SSH connection successful"
+else
+  log "❌ SSH connection failed"
+  exit 1
+fi
+
+#==============================#
+#     REMOTE SERVER SETUP      #
+#==============================#
+log "⚙️  Preparing remote server..."
+
+ssh -i "$SSH_KEY" "$SSH_USER@$REMOTE_IP" bash -s <<EOF
+set -euo pipefail
+
+echo "🔄 Updating packages..."
+sudo apt-get update -y
+
+echo "🐳 Installing Docker..."
+if ! command -v docker &>/dev/null; then
+  sudo apt-get install -y ca-certificates curl gnupg lsb-release
+  sudo mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo \
+    "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update -y
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+fi
+
+echo "🧰 Installing Nginx..."
+if ! command -v nginx &>/dev/null; then
+  sudo apt-get install -y nginx
+fi
+
+sudo systemctl enable docker
+sudo systemctl enable nginx
+sudo systemctl start docker
+sudo systemctl start nginx
+EOF
+
+log "✅ Server setup complete"
+
+#==============================#
+#     DEPLOYMENT STAGE         #
+#==============================#
+log "📦 Deploying application container..."
+
+# Copy files to server
+scp -i "$SSH_KEY" -r app "$SSH_USER@$REMOTE_IP":~/app >>"$LOG_FILE" 2>&1
+
+ssh -i "$SSH_KEY" "$SSH_USER@$REMOTE_IP" bash -s <<EOF
+set -euo pipefail
+cd ~/app
+
+echo "🛠️  Building Docker image..."
+sudo docker build -t stage1-app .
+
+echo "🧹 Removing old container if exists..."
+sudo docker rm -f stage1-container || true
+
+echo "🚀 Running container on port $APP_PORT..."
+sudo docker run -d -p $APP_PORT:80 --name stage1-container stage1-app
+
+echo "⚙️  Configuring Nginx as reverse proxy..."
+sudo tee /etc/nginx/sites-available/stage1 > /dev/null <<NGINX
+server {
+    listen 80;
+    location / {
+        proxy_pass http://localhost:$APP_PORT;
+    }
+}
+NGINX
+
+sudo ln -sf /etc/nginx/sites-available/stage1 /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+EOF
+
+log "✅ Application deployed and Nginx configured"
+
+#==============================#
+#     VALIDATION STAGE         #
+#==============================#
+log "🔎 Validating deployment..."
+ssh -i "$SSH_KEY" "$SSH_USER@$REMOTE_IP" "
+sudo docker ps | grep stage1-container && echo '✅ Docker container is running';
+sudo systemctl status nginx | grep active
+"
+
+log "🎯 Deployment complete!"
+echo "Access your app at: http://$REMOTE_IP"
